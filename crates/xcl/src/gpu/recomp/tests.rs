@@ -7452,3 +7452,65 @@ fn fspx_containers_translate_and_compile() {
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
 }
+
+/// Compare Scarlett Layer's synthetic FMA modifier case 02 (jadeowaowa, 0e436b3).
+/// https://github.com/jadeowaowa/scarlett-layer/blob/0e436b3e1c654765b193c1cb705918fbf101b10b/src/tests/scarlett_tests/tests_rdna2_oracle.cpp#L31-L46
+#[test]
+fn gpu_fma_f32_abs_neg_clamp_oracle() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)], None),
+        (
+            "V_SUB_F32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 255), ("VSRC1", 1)],
+            Some(32.0f32.to_bits()),
+        ),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 255)], Some(0.05f32.to_bits())),
+        (
+            "V_FMA_F32", "ENC_VOP3",
+            &[("VDST", 4), ("SRC0", V + 2), ("SRC1", V + 3), ("SRC2", 240),
+              ("ABS", 1), ("NEG", 2), ("CLAMP", 1)],
+            None,
+        ),
+        (
+            "V_FMA_F32", "ENC_VOP3", &[("VDST", 5), ("SRC0", V + 2), ("SRC1", V + 3), ("SRC2", 240)],
+            None,
+        ),
+    ]);
+    let run_case = |wave64, split_wave64| {
+        let lanes = if wave64 { 64 } else { 32 };
+        let options = Options { wave64, split_wave64, ..Default::default() };
+        let test = translate(&code, &options).unwrap();
+        assert!(test.complete(), "{:?}", test.unsupported_why);
+        let dxil = super::dxc::compile(&test.hlsl, "main", "cs_6_6", &[]).unwrap();
+        for start in (0..64).step_by(lanes) {
+            let mut state = KernelState::default();
+            for (lane, registers) in state.vgpr.iter_mut().take(lanes).enumerate() {
+                registers[0] = (start + lane) as u32;
+            }
+            let result = runner::run(&dxil, &state, &[]).unwrap();
+            for (lane, registers) in result.vgpr.iter().take(lanes).enumerate() {
+                let id = start + lane;
+                let x = 32.0 - id as f32;
+                let want = x.abs().mul_add(-0.05, 0.5).clamp(0.0, 1.0);
+                let control = x.mul_add(0.05, 0.5);
+                let actual = f32::from_bits(registers[4]);
+                let plain = f32::from_bits(registers[5]);
+                assert!(
+                    (actual - want).abs() <= 1e-5,
+                    "wave{lanes} split={split_wave64} id={id} modified: {actual} vs {want}"
+                );
+                assert!(
+                    (plain - control).abs() <= 1e-5,
+                    "wave{lanes} split={split_wave64} id={id} plain: {plain} vs {control}"
+                );
+            }
+        }
+        println!("wave{lanes} split={split_wave64}: 64/64 modified and plain values agree");
+    };
+    for wave64 in gpu_waves() {
+        run_case(wave64, false);
+    }
+    run_case(true, true);
+}
