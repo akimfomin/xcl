@@ -7006,6 +7006,8 @@ fn gpu_ds_permute_b32() {
             ("DS_PERMUTE_B32", "ENC_DS", &[("VDST", 12), ("ADDR", 3), ("DATA0", 0), ("OFFSET0", 8)], None),
             // offset 128 = 32 lanes: the identity, it does not move a lane to the other half
             ("DS_PERMUTE_B32", "ENC_DS", &[("VDST", 13), ("ADDR", 3), ("DATA0", 0), ("OFFSET0", 128)], None),
+            // Two low address bits and an offset of two carry into the lane index.
+            ("DS_PERMUTE_B32", "ENC_DS", &[("VDST", 14), ("ADDR", 4), ("DATA0", 0), ("OFFSET0", 2)], None),
         ]);
         let code = prog(&insns);
         let t = translate(&code, &Options { wave64, split_wave64, ..Default::default() }).unwrap();
@@ -7019,9 +7021,11 @@ fn gpu_ds_permute_b32() {
             a2.push(4 * (l / 2) as u32 + 0x0001_0000);
             a3.push(4 * l as u32);
         }
+        let a4: Vec<_> = a3.iter().map(|addr| addr + 2).collect();
         for (l, r) in st.vgpr.iter_mut().take(lanes).enumerate() {
             (r[0], r[1], r[2], r[3]) = (data[l], a1[l], a2[l], a3[l]);
-            for dst in 10..=13 {
+            r[4] = a4[l];
+            for dst in 10..=14 {
                 r[dst] = 0xCAFE_BABE;
             }
         }
@@ -7031,6 +7035,7 @@ fn gpu_ds_permute_b32() {
             ds_permute_reference(lanes, exec, &a2, 0, &data, 0xCAFE_BABE),
             ds_permute_reference(lanes, exec, &a3, 8, &data, 0xCAFE_BABE),
             ds_permute_reference(lanes, exec, &a3, 128, &data, 0xCAFE_BABE),
+            ds_permute_reference(lanes, exec, &a4, 2, &data, 0xCAFE_BABE),
         ];
         for l in 0..lanes {
             for (k, w) in want.iter().enumerate() {
