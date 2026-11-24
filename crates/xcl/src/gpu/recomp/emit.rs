@@ -4104,7 +4104,12 @@ impl Em {
         }
         if let Some((write, n, stride, two)) = rw(name) {
             let addrs: Vec<String> = if two {
-                vec![format!("{a} + {}u", o0 * stride), format!("{a} + {}u", o1 * stride)]
+                let mut addrs = vec![format!("{a} + {}u", o0 * stride)];
+                // RDNA 2 ISA §10.4.3: equal offsets in a paired store use only DATA0.
+                if !write || o0 != o1 {
+                    addrs.push(format!("{a} + {}u", o1 * stride));
+                }
+                addrs
             } else {
                 vec![format!("{a} + {off16}u")]
             };

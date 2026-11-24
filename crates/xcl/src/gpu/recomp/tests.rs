@@ -3817,6 +3817,60 @@ fn gpu_geometry_wave32_prefix_count_over_a_mask() {
     }
 }
 
+fn check_paired_lds_writes(equal_offsets: bool) {
+    if !gpu_ready() {
+        return;
+    }
+    let mut wrong = Vec::new();
+    for (op, read, words, stride, distinct_offset) in [
+        ("DS_WRITE2_B32", "DS_READ_B32", 1, 4, 2),
+        ("DS_WRITE2_B64", "DS_READ_B64", 2, 8, 2),
+        ("DS_WRITE2ST64_B32", "DS_READ_B32", 1, 256, 5),
+        ("DS_WRITE2ST64_B64", "DS_READ_B64", 2, 512, 5),
+    ] {
+        let offset0 = 1;
+        let offset1 = if equal_offsets { offset0 } else { distinct_offset };
+        let offsets = [offset0 * stride, offset1 * stride];
+        let mut code = Vec::new();
+        code.extend(encode(op, "ENC_DS", &[
+            ("ADDR", 1), ("DATA0", 2), ("DATA1", 4), ("OFFSET0", offset0), ("OFFSET1", offset1),
+        ], None).unwrap());
+        for (dst, offset) in [6, 8].into_iter().zip(offsets) {
+            code.extend(encode(read, "ENC_DS", &[
+                ("ADDR", 1), ("VDST", dst), ("OFFSET0", offset & 255), ("OFFSET1", offset >> 8),
+            ], None).unwrap());
+        }
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let mut st = KernelState::default();
+        for (lane, r) in st.vgpr.iter_mut().enumerate() {
+            // For ST64 the two distinct offset ranges are at least 64 * 16 bytes apart.
+            r[1] = 16 * lane as u32;
+            r[2..6].copy_from_slice(&[1000, 2000, 3000, 4000].map(|x| x + lane as u32));
+        }
+        let result = runner::run_code(&code, &st, &[]).unwrap();
+        let mut wrong_lanes = (0..64).filter_map(|lane| {
+            let first = &st.vgpr[lane][2..2 + words];
+            let second = if equal_offsets { first } else { &st.vgpr[lane][4..4 + words] };
+            let got = (&result.vgpr[lane][6..6 + words], &result.vgpr[lane][8..8 + words]);
+            (got != (first, second)).then_some((lane, got, (first, second)))
+        });
+        if let Some((lane, got, want)) = wrong_lanes.next() {
+            wrong.push(format!("{op}: {} wrong lanes, lane {lane} got {got:?}, want {want:?}", 1 + wrong_lanes.count()));
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+#[test]
+fn gpu_ds_paired_write_equal_offsets_uses_first_data() {
+    check_paired_lds_writes(true);
+}
+
+#[test]
+fn gpu_ds_paired_write_distinct_offsets_uses_both_data() {
+    check_paired_lds_writes(false);
+}
+
 /// A DS read whose destination overlaps its address register reads the address first
 /// (retail GS code: `ds_read2_b32 v[0:1], v0 offset1:1`).
 #[test]
