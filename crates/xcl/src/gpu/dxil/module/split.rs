@@ -1,6 +1,10 @@
 //! Partition the optimized compute entry at CFG edges. A dispatch cannot
 //! jump back to an earlier dispatch, so a strongly connected component is
-//! indivisible. Each crossing edge has its own compact state layout.
+//! indivisible. Scratch payload words can be reused across disjoint piece lifetimes.
+//!
+//! The PortBridge compact-slots patch (GPL-2.0-only, 2026-11-25) adds the
+//! lifetime allocator to Kalmarv's persistent-payload layout at XCL #2126.
+//! Source: https://github.com/akimfomin/PortBridge/tree/2e46a3635ee7725860ceec08ca246a2ab14615b9/research/xcl-2126-compact-slots
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -23,6 +27,57 @@ pub(crate) struct Plan {
 pub struct DispatchChain {
     pub pieces: Vec<Vec<u8>>,
     pub dwords_per_group: u32,
+}
+
+struct PayloadLifetime {
+    value: Value,
+    first: usize,
+    last: usize,
+    words: u32,
+}
+
+type ScratchLayout = (u32, BTreeMap<Value, u32>);
+
+fn reuse_payload_slots(mut lifetimes: Vec<PayloadLifetime>) -> Option<ScratchLayout> {
+    lifetimes.sort_unstable_by_key(|life| (life.first, std::cmp::Reverse(life.last), life.value));
+    let mut active = BTreeSet::<(usize, u32, u32)>::new();
+    let mut free = BTreeSet::<u32>::new();
+    let mut pairs = BTreeSet::<u32>::new();
+    let mut slots = BTreeMap::new();
+    let mut stride = 1; // Slot zero is always the continuation tag.
+    for life in lifetimes {
+        // No slot can be restored and overwritten in the same piece. Restores
+        // can move after a branch, so the last carrying destination is inclusive.
+        while active.first().is_some_and(|&(last, _, _)| last < life.first) {
+            let (_, start, end) = active.pop_first()?;
+            for word in start..end {
+                if free.contains(&(word - 1)) {
+                    pairs.insert(word - 1);
+                }
+                if free.contains(&(word + 1)) {
+                    pairs.insert(word);
+                }
+                free.insert(word);
+            }
+        }
+        let slot = match life.words {
+            1 => free.first().copied().unwrap_or(stride),
+            2 => pairs.first().copied().unwrap_or_else(|| {
+                if free.contains(&(stride - 1)) { stride - 1 } else { stride }
+            }),
+            _ => return None,
+        };
+        let end = slot.checked_add(life.words)?;
+        for word in slot..end {
+            free.remove(&word);
+            pairs.remove(&word);
+            pairs.remove(&(word - 1));
+        }
+        stride = stride.max(end);
+        slots.insert(life.value, slot);
+        active.insert((life.last, slot, end));
+    }
+    Some((stride, slots))
 }
 
 struct Scratch {
@@ -133,21 +188,7 @@ impl Shader {
             if exchange != 0 { return None; }
         }
         let plan = self.m.dispatch_plan(limit)?;
-        // Slot zero is the tag. Every transported SSA value owns its payload slots
-        // until the chain finishes. An outgoing store can never overwrite a value
-        // restored by the same piece, even when the restore is sunk past a branch.
-        let mut stride = 1u32;
-        let mut slots = BTreeMap::new();
-        for value in plan.edges.iter().flat_map(|e| e.live.iter().copied()).collect::<BTreeSet<_>>() {
-            let words = self.m.transport_words(value)?;
-            if words != 0 {
-                slots.insert(value, stride);
-                stride = stride.checked_add(words)?;
-            }
-        }
-        if cfg!(test) && std::env::var_os("XCL_SAMPLE_SLOT_REUSE").is_some() {
-            (stride, slots) = self.m.reuse_piece_slots(&plan, &slots)?;
-        }
+        let (stride, slots) = self.m.scratch_slots(&plan)?;
         stride.checked_mul(threads[0])?.checked_mul(4)?;
         let pieces = (0..plan.blocks.len()).map(|i| self.make_piece(&plan, i, stride, &slots, threads, &prefix)).collect::<Option<Vec<_>>>()?;
         Some(DispatchChain { pieces, dwords_per_group: stride.checked_mul(threads[0])? })
@@ -251,7 +292,7 @@ impl Shader {
             let Some(&(b, tag)) = exits.get(&(edge.from, edge.to)) else { continue };
             dst.m.set_block(b);
             for &v in &edge.live {
-                // The defining piece writes a distinct slot. Later pieces can bypass
+                // The defining piece writes its assigned slot. Later pieces can bypass
                 // it or read it without copying it at their own outgoing edges.
                 if let Some(&slot) = slots.get(&v) {
                     if !local.contains_key(&src.def_block[inst(v)?]) { continue; }
@@ -316,6 +357,7 @@ fn inst(v: Value) -> Option<usize> {
 }
 
 impl Module {
+    #[cfg(test)]
     fn reuse_piece_slots(&self, plan: &Plan, slots: &BTreeMap<Value, u32>) -> Option<(u32, BTreeMap<Value, u32>)> {
         let mut stage = vec![0; self.blocks.len()];
         for (i, blocks) in plan.blocks.iter().enumerate() {
@@ -500,6 +542,53 @@ impl Module {
             }
         }
         None
+    }
+
+    fn scratch_slots(&self, plan: &Plan) -> Option<ScratchLayout> {
+        let mut stages = vec![None; self.blocks.len()];
+        for (stage, blocks) in plan.blocks.iter().enumerate() {
+            for &block in blocks {
+                stages[block.0 as usize] = Some(stage);
+            }
+        }
+        let mut lifetimes = BTreeMap::<Value, PayloadLifetime>::new();
+        for edge in &plan.edges {
+            let from = stages[edge.from.0 as usize]?;
+            let to = stages[edge.to.0 as usize]?;
+            if from >= to {
+                return None;
+            }
+            for &value in &edge.live {
+                if let Some(life) = lifetimes.get_mut(&value) {
+                    life.last = life.last.max(to);
+                    continue;
+                }
+                let words = self.transport_words(value)?;
+                if words == 0 {
+                    continue;
+                }
+                let definition = self.def_block[inst(value)?];
+                let first = stages[definition.0 as usize]?;
+                if first > from {
+                    return None;
+                }
+                lifetimes.insert(value, PayloadLifetime { value, first, last: to, words });
+            }
+        }
+
+        let mut fixed = (1u32, BTreeMap::new());
+        for life in lifetimes.values() {
+            fixed.1.insert(life.value, fixed.0);
+            fixed.0 = fixed.0.checked_add(life.words)?;
+        }
+        // Keep #2371's opt-in offline comparator on the original fixed offsets.
+        #[cfg(test)]
+        if std::env::var_os("XCL_SAMPLE_SLOT_REUSE").is_some() {
+            return self.reuse_piece_slots(plan, &fixed.1);
+        }
+        let compact = reuse_payload_slots(lifetimes.into_values().collect())?;
+        // Keep the original offsets and emitted DXIL if reuse saves no space.
+        Some(if compact.0 < fixed.0 { compact } else { fixed })
     }
 
     fn transport_words(&self, v: Value) -> Option<u32> {
@@ -716,6 +805,70 @@ mod tests {
     };
 
     #[test]
+    fn scratch_layout_keeps_the_offline_first_fit_comparison() {
+        use super::{Edge, Module, Plan};
+
+        let mut m = Module::new();
+        let start = m.entry_block();
+        let middle = m.new_block();
+        let later = m.new_block();
+        let end = m.new_block();
+        let one = m.i32c(1);
+        let a = m.bin(BinOp::Add, one, one);
+        let b = m.bin(BinOp::Add, a, one);
+        let c = m.bin(BinOp::Add, b, one);
+        m.br(middle);
+        m.set_block(middle);
+        m.bin(BinOp::Add, a, c);
+        m.br(later);
+        m.set_block(later);
+        let wide = m.i64();
+        let d = m.cast(CastOp::ZExt, b, wide);
+        m.br(end);
+        m.set_block(end);
+        let extended = m.cast(CastOp::ZExt, b, wide);
+        m.bin(BinOp::Add, extended, d);
+        m.ret();
+
+        let plan = Plan {
+            blocks: vec![vec![start], vec![middle], vec![later], vec![end]],
+            edges: vec![Edge { from: start, to: middle, live: vec![a, b, c] },
+                        Edge { from: middle, to: later, live: vec![b] },
+                        Edge { from: later, to: end, live: vec![b, d] }],
+        };
+        let (stride, slots) = m.scratch_slots(&plan).unwrap();
+        // The #2371 sample layout orders equal-start values by ID. The
+        // production candidate keeps long-lived b at the edge so d fits.
+        if std::env::var_os("XCL_SAMPLE_SLOT_REUSE").is_some() {
+            assert_eq!((stride, slots[&b], slots[&d]), (6, 2, 4));
+        } else {
+            assert_eq!((stride, slots[&b], slots[&d]), (4, 1, 2));
+        }
+    }
+
+    #[test]
+    fn payload_slots_reopen_only_after_the_last_consumer() {
+        use super::{PayloadLifetime, Value, reuse_payload_slots};
+
+        let life = |id, first, last, words| PayloadLifetime {
+            value: Value::Inst(id), first, last, words,
+        };
+        let (stride, slots) = reuse_payload_slots(vec![
+            life(0, 0, 1, 2),
+            life(1, 0, 2, 1),
+            life(2, 1, 2, 1),
+            life(3, 2, 3, 2),
+        ]).unwrap();
+        assert_eq!(stride, 5);
+        // Slot zero stays the continuation tag. On the shared boundary the
+        // first two-word value is live, so the next value still needs slot four.
+        assert_eq!(slots[&Value::Inst(1)], 1);
+        assert_eq!(slots[&Value::Inst(0)], 2);
+        assert_eq!(slots[&Value::Inst(2)], 4);
+        assert_eq!(slots[&Value::Inst(3)], 2);
+    }
+
+    #[test]
     fn oversized_loop_occupies_one_piece_up_to_the_hard_ceiling() {
         use super::{Block, Module};
 
@@ -763,8 +916,8 @@ mod tests {
         assert!(m.dispatch_plan(4).is_none());
     }
 
-    fn compare(threads: u32, extra_adds: u32) {
-        if !runner::wave32_supported().unwrap_or(false) {
+    fn compare(threads: u32, extra_adds: u32, run_gpu: bool) {
+        if run_gpu && !runner::wave32_supported().unwrap_or(false) {
             runner::skip_test("no wave32 GPU");
             return;
         }
@@ -839,11 +992,17 @@ mod tests {
             let plan = lw.s.m.dispatch_plan(40).expect("partition around oversized loop");
             assert!(plan.blocks.iter().any(|piece| piece == &[oversized]));
         }
-        let chain = lw.s.split_compute(geometry, split.then_some(tid), 40);
+        let chain = lw.s.split_compute(geometry, split.then_some(tid), 40)
+            .expect("split the synthetic program");
+        assert!(chain.pieces.len() >= 3);
+        if !split && extra_adds == 0 && std::env::var_os("XCL_SAMPLE_SLOT_REUSE").is_none() {
+            assert_eq!(chain.dwords_per_group, 256, "exercise actual Wave32 payload reuse");
+        }
+        if !run_gpu {
+            return;
+        }
         let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
         crate::gpu::dxil::validate::validate(&whole).expect("valid unsplit fixture");
-        let chain = chain.expect("split the synthetic program");
-        assert!(chain.pieces.len() >= 3);
         let initial: Vec<_> = (1..=threads * 3).collect();
         let expected: Vec<_> = initial.iter().enumerate().map(|(i, &v)| {
             let n = (i as u32 % 4) + 1;
@@ -982,15 +1141,18 @@ mod tests {
     fn dispatch_chain_payload_survives_reused_edge_slot() { check_persistent_payload(true); }
 
     #[test]
-    fn dispatch_chain_wave32_live_loops() { compare(32, 0); }
+    fn dispatch_chain_wave32_live_loops() { compare(32, 0, true); }
+
+    #[test]
+    fn dispatch_chain_wave32_reuses_scratch_before_gpu_run() { compare(32, 0, false); }
 
     /// A guest wave64 split across two hardware wave32s.
     #[test]
-    fn dispatch_chain_wave64_live_loops_and_exchange() { compare(64, 0); }
+    fn dispatch_chain_wave64_live_loops_and_exchange() { compare(64, 0, true); }
     #[test]
     fn dispatch_chain_oversized_loop_matches_whole() {
-        compare(32, 48);
-        compare(64, 48);
+        compare(32, 48, true);
+        compare(64, 48, true);
     }
 
     /// Early exits and forward skips retain their own continuation tags; group
