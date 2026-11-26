@@ -217,6 +217,14 @@ fn translate_on_this_thread(
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
     lw.project_pixel_masks = project_pixel_masks;
+    // A scalar population count can observe every bit accumulated over a loop.
+    // Keep the reference lowering for this class until its whole-word consumers
+    // can be proved independently of the loop's changing EXEC participation.
+    if lw.project_pixel_masks && !cfg.headers.is_empty() && cfg.insts.iter().any(|d| {
+        matches!(d.inst.name, "S_BCNT0_I32_B32" | "S_BCNT0_I32_B64" | "S_BCNT1_I32_B32" | "S_BCNT1_I32_B64")
+    }) {
+        lw.project_pixel_masks = false;
+    }
     let uses_lds = lw.lds.is_some();
     let res = lw.res;
     let io = lw.init.io.expect("the I/O buffer");

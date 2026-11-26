@@ -545,6 +545,28 @@ impl Module {
         matches!(self.insts[i as usize].op, Op::Bin(BinOp::Or, l, r, 0)
             if (l, r) == (a, b) || (l, r) == (b, a))
     }
+    /// Evaluate the constant-input i32 packing emitted by the pixel-mask regression.
+    /// The builder deliberately retains zext instructions until later optimization.
+    #[cfg(test)]
+    pub(super) fn eval_mask_test_word(&self, value: Value) -> Option<u32> {
+        if let Some(n) = self.const_u64(value) {
+            return u32::try_from(n).ok();
+        }
+        let Value::Inst(index) = value else { return None };
+        let inst = &self.insts[index as usize];
+        if self.int_width(inst.ty) != Some(32) {
+            return None;
+        }
+        match inst.op {
+            Op::Cast(CastOp::ZExt, input, _) if self.int_width(self.value_ty(input)) == Some(1) =>
+                self.eval_mask_test_word(input),
+            Op::Bin(BinOp::Shl, left, right, 0) =>
+                self.eval_mask_test_word(left)?.checked_shl(self.eval_mask_test_word(right)?),
+            Op::Bin(BinOp::Or, left, right, 0) =>
+                Some(self.eval_mask_test_word(left)? | self.eval_mask_test_word(right)?),
+            _ => None,
+        }
+    }
     /// When enabled, emitting into an already-terminated block inserts immediately
     /// before its terminator (used for hoisting pure computations to a value's
     /// defining block). Returns the previous setting.

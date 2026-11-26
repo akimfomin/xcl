@@ -925,7 +925,8 @@ mod ps_ballot_tests {
         let mut state = 0xc50f_6271u32;
         for wave64 in [false, true] {
             let opt = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
-            let mut lw = super::Lw::new(&[], &Default::default(), opt, &kernel::Entry::Pixel(ps_interface(), true));
+            let mut lw = super::Lw::new(&[], &Default::default(), opt, &kernel::Entry::Pixel(ps_interface()));
+            lw.project_pixel_masks = true;
             for pattern in 0..35 {
                 let votes: [[u32; 2]; 4] = std::array::from_fn(|p| std::array::from_fn(|half| {
                     state ^= state << 13;
@@ -962,14 +963,14 @@ mod ps_ballot_tests {
                     assert_eq!(lw.s.m.const_u64(nonempty), Some(u64::from(expected_any)));
                     let window = lw.project_mask_window(mask, 0);
                     let shift = lane & 28;
-                    assert_eq!(lw.s.m.const_u64(window), Some(u64::from(full[half] >> shift & 15)));
+                    assert_eq!(lw.s.m.eval_mask_test_word(window), Some(full[half] >> shift & 15), "wave64={wave64} lane={lane} pattern={pattern}");
                     let extra = (lw.c(0x0f01_f0a0), lw.c(if wave64 { 0x01e0_30b0 } else { 0 }));
                     let merged = (lw.or(mask.0, extra.0), lw.or(mask.1, extra.1));
                     lw.note_mask_union(merged, [mask, extra]);
                     let window = lw.project_mask_window(merged, 0);
                     let other = if wave64 && half == 1 { 0x01e0_30b0 } else { 0x0f01_f0a0 };
                     let expected = (full[half] | other) >> shift & 15;
-                    assert_eq!(lw.s.m.const_u64(window), Some(u64::from(expected)));
+                    assert_eq!(lw.s.m.eval_mask_test_word(window), Some(expected), "wave64={wave64} lane={lane} pattern={pattern}");
                     if wave64 {
                         let mixed = (mask.0, extra.1);
                         if mixed != mask {
@@ -986,7 +987,8 @@ mod ps_ballot_tests {
         for wave64 in [false, true] {
             let ps = ps_interface();
             let options = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
-            let mut lw = super::Lw::new(&[], &Default::default(), options, &kernel::Entry::Pixel(ps.clone(), true));
+            let mut lw = super::Lw::new(&[], &Default::default(), options, &kernel::Entry::Pixel(ps.clone()));
+            lw.project_pixel_masks = true;
             lw.setup_lanes_gfx();
             lw.setup_pixel(&ps, &Default::default());
             let entry = lw.cur();
