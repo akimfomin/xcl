@@ -471,11 +471,13 @@ impl Lw {
         let need_hi = self.wave64 || self.gfx_half.is_some();
         let mut m0 = z;
         let mut m1 = z;
+        let mut votes = [[z; 2]; 4];
         for p in 0..4u32 {
             let qp = self.lshrc(q, p);
             let qp = self.andc(qp, 1);
             let bit = self.nz(qp);
             let w = self.s.wave_ballot(bit);
+            votes[p as usize] = [w[0], w[1]];
             let spread = |lw: &mut Lw, mut v: Value| -> Value {
                 let s1 = lw.lshrc(v, 1);
                 v = lw.or(v, s1);
@@ -491,13 +493,43 @@ impl Lw {
                 m1 = self.or(m1, b1);
             }
         }
-        if !self.wave64 {
-            if let Some(h) = self.gfx_half {
-                return (self.sel(h, m1, m0), z);
-            }
-            return (m0, z);
+        let (lo, hi) = if self.wave64 {
+            (m0, m1)
+        } else if let Some(h) = self.gfx_half {
+            (self.sel(h, m1, m0), z)
+        } else {
+            (m0, z)
+        };
+        if self.project_pixel_masks {
+            self.last_pixel_ballots = Some((self.cur(), lo, hi, votes));
         }
-        (m0, m1)
+        (lo, hi)
+    }
+
+    pub(super) fn project_quad_ballots(&mut self, ballots: &[[Value; 2]; 4]) -> Value {
+        let mut w = [self.c(0); 4];
+        for (p, ballot) in ballots.iter().enumerate() {
+            w[p] = if self.wave64 {
+                self.sel(self.upper, ballot[1], ballot[0])
+            } else if let Some(half) = self.gfx_half {
+                self.sel(half, ballot[1], ballot[0])
+            } else {
+                ballot[0]
+            };
+        }
+        let b0 = self.andc(self.lane31, 1);
+        let b0 = self.nz(b0);
+        let b1 = self.andc(self.lane31, 2);
+        let b1 = self.nz(b1);
+        let a = self.sel(b0, w[1], w[0]);
+        let b = self.sel(b0, w[3], w[2]);
+        let vote = self.sel(b1, b, a);
+        // The reference spread sets output bit 4k+p iff any bit of ballot[p]'s
+        // nibble k is set. Other nibbles cannot cross a four-lane boundary.
+        let shift = self.andc(self.lane31, 28);
+        let nibble = self.lshr(vote, shift);
+        let nibble = self.andc(nibble, 15);
+        self.nz(nibble)
     }
 
     /// Pixel-shader ballot including helper lanes (parity with HLSL `ballot_px` in
@@ -698,6 +730,89 @@ mod ps_ballot_tests {
         ps_code
     }
 
+    /// The reference is a four-pass ballot with OR over all four carrier lanes per bit.
+    /// Feed independently arbitrary words, even different high and low halves and no
+    /// votes in a quad. This exercises the emitted arithmetic without relying on which
+    /// values any driver happens to return to helpers.
+    #[test]
+    fn projected_mask_preserves_the_observed_bit_for_arbitrary_ballot_words() {
+        let mut state = 0x7aa8b247u32;
+        for wave64 in [false, true] {
+            let opt = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+            let mut lw = super::Lw::new(&[], &Default::default(), opt, &kernel::Entry::Pixel(ps_interface(), true));
+            for pattern in 0..26 {
+                let raw: [[u32; 2]; 4] = std::array::from_fn(|p| std::array::from_fn(|halfwave| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    match pattern {
+                        0 => 0,
+                        1 => u32::MAX,
+                        2..=17 => ((pattern - 2) as u32).rotate_left((4 * (p + halfwave)) as u32),
+                        _ => state,
+                    }
+                }));
+                let ballots = raw.map(|v| [lw.c(v[0]), lw.c(v[1])]);
+                for lane in 0..64u32 {
+                    let halfwave = (lane >> 5) as usize;
+                    let local = (lane & 31) as usize;
+                    let quad = local & !3;
+                    let expected = (0..4).any(|carrier| raw[local & 3][halfwave] >> (quad + carrier) & 1 != 0);
+                    lw.lane31 = lw.c(local as u32);
+                    lw.upper = lw.b(wave64 && halfwave == 1);
+                    lw.gfx_half = if wave64 { None } else { Some(lw.b(halfwave == 1)) };
+                    let bit = lw.project_quad_ballots(&ballots);
+                    let got = lw.s.m.const_u64(bit).expect("constant projection");
+                    assert_eq!(got, u64::from(expected), "wave64={wave64} lane={lane} pattern={pattern}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn projected_mask_preserves_wave32_high_word_after_adjacent_carry() {
+        let mut code = Vec::new();
+        for (name, enc, fields) in [
+            ("V_ADD_CO_U32", "VOP3_SDST_ENC", vec![("VDST", 4), ("SDST", 21), ("SRC0", V + 2), ("SRC1", V + 3)]),
+            ("V_ADD_CO_U32", "VOP3_SDST_ENC", vec![("VDST", 4), ("SDST", 20), ("SRC0", 128), ("SRC1", V + 2)]),
+            ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 5), ("SRC0", 21)]),
+            ("EXP", "ENC_EXP", vec![("TGT", 0), ("EN", 1), ("VSRC0", 5), ("DONE", 1), ("VM", 1)]),
+            ("S_ENDPGM", "ENC_SOPP", vec![]),
+        ] {
+            code.extend(encode(name, enc, &fields, None).unwrap());
+        }
+        let opt = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let original = kernel::translate_pixel(&code, opt, &ps_interface()).unwrap();
+        let projected = kernel::translate_pixel_projected_masks(&code, opt, &ps_interface()).unwrap();
+        assert!(original.dxil == projected.dxil, "wave32 carry wrote only s20; s21 is read as a whole word");
+    }
+
+    #[test]
+    fn projected_mask_leaves_divergent_loop_exit_popcount_whole() {
+        // Hand-assembled public #1498 loop: OR exiting VCC lanes into s10 and
+        // count the accumulated mask after EXEC is restored. A lane-splat reads 1
+        // instead of the population if the scalar use is missed. Use the actual
+        // forward/backward CFG and require identical emitted containers.
+        for wave64 in [false, true] {
+            let mut words = [
+                0x4a020081u32, 0xbe8a0380, 0x4e020281, 0x7d840280, 0x880a0a6a,
+                0x8a7e0a7e, 0xbf89fffb, 0x887e0a7e, 0xbe890f0a, 0x7e040209,
+            ];
+            if wave64 {
+                for (i, word) in [(1, 0xbe8a0480), (4, 0x888a0a6a), (5, 0x8afe0a7e), (7, 0x88fe0a7e), (8, 0xbe89100a)] {
+                    words[i] = word;
+                }
+            }
+            let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            code.extend(encode("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 1), ("VSRC0", 2), ("DONE", 1), ("VM", 1)], None).unwrap());
+            code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+            let opt = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+            let original = kernel::translate_pixel(&code, opt, &ps_interface()).unwrap();
+            let projected = kernel::translate_pixel_projected_masks(&code, opt, &ps_interface()).unwrap();
+            assert_eq!(original.dxil, projected.dxil, "wave64={wave64}: VCC goes into a whole scalar accumulator");
+        }
+    }
+
     #[test]
     fn direct_ps_ballot_uses_quad_ops_and_keeps_entry_exec_live_only() {
         let psi = ps_interface();
@@ -797,7 +912,16 @@ mod ps_ballot_tests {
             let opt = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
             let ps = kernel::translate_pixel(&helper_lane_masks_ps_code(wave64), opt, &psi).expect("translate PS");
             let px = runner::draw(&vs, &ps.dxil, &layout, &quad, 8, &[], &[], size as u32, [9.0; 4]).unwrap();
+            let projected = kernel::translate_pixel_projected_masks(&helper_lane_masks_ps_code(wave64), opt, &psi).unwrap();
+            let pp = runner::draw(&vs, &projected.dxil, &layout, &quad, 8, &[], &[], size as u32, [9.0; 4]).unwrap();
             let lanes = if wave64 { 64.0 } else { 32.0 };
+            assert_eq!(px.len(), pp.len());
+            for (i, (reference, candidate)) in px.iter().zip(&pp).enumerate() {
+                // The waterfall iteration count depends on physical wave packing.
+                assert_eq!([candidate[0], candidate[1], candidate[3]], [reference[0], reference[1], reference[3]],
+                    "wave64={wave64} derivatives and coverage at pixel {i}");
+                assert!((1.0..=lanes).contains(&candidate[2]), "wave64={wave64} waterfall at pixel {i}");
+            }
             let bad: Vec<(usize, usize, [f32; 4])> = (0..size * size)
                 .filter(|&i| {
                     let p = px[i];

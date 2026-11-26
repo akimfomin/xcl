@@ -117,7 +117,12 @@ pub fn translate_vertex(code: &[u8], o: KernelOptions, vs: &VsInterface) -> Resu
 
 /// A pixel shader (the recompiler's `Mode::Pixel`; wave-size independent).
 pub fn translate_pixel(code: &[u8], o: KernelOptions, ps: &PsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Pixel(ps.clone()), None, None, 0)
+    translate_entry(code, o, Entry::Pixel(ps.clone(), false), None, None, 0)
+}
+
+/// Offline pixel comparison that retains the original ballots and projects only observed bits.
+pub fn translate_pixel_projected_masks(code: &[u8], o: KernelOptions, ps: &PsInterface) -> Result<Kernel, String> {
+    translate_entry(code, o, Entry::Pixel(ps.clone(), true), None, None, 0)
 }
 
 /// A geometry-mode (ES+GS) program: the compute pass that writes one mesh record per
@@ -133,7 +138,7 @@ pub enum Entry {
     Compute(CsInterface),
     Mesh(MsInterface),
     Vertex(VsInterface),
-    Pixel(PsInterface),
+    Pixel(PsInterface, bool),
     Geometry(GsInterface),
 }
 
@@ -204,7 +209,7 @@ fn translate_on_this_thread(
     };
     let kernel = matches!(entry, Entry::Kernel);
     let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_));
-    let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
+    let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(..));
     let compute = matches!(entry, Entry::Compute(_));
     let split = o.wave64 && o.split && !gfx;
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
@@ -252,7 +257,7 @@ fn translate_on_this_thread(
             lw.setup_vertex(vs, &used);
             [1, 1, 1]
         }
-        Entry::Pixel(ps) => {
+        Entry::Pixel(ps, _) => {
             lw.setup_lanes_gfx();
             let modes = crate::gpu::recomp::emit::ps_attr_modes(&cfg.insts, ps.input_ena);
             lw.setup_pixel(ps, &modes);
@@ -484,11 +489,11 @@ impl Lw {
             Entry::Mesh(ms) => Some(ms.clone()),
             _ => None,
         };
-        let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
+        let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(..));
         let split = split && !gfx;
         let stage = match entry {
             Entry::Vertex(_) => Stage::Vertex,
-            Entry::Pixel(_) => Stage::Pixel,
+            Entry::Pixel(..) => Stage::Pixel,
             _ => Stage::Compute,
         };
         let mut s = Shader::new(stage, (6, 6));
@@ -530,6 +535,8 @@ impl Lw {
             has_f64_round_op: false,
             img_writes: crate::gpu::recomp::emit::image_write_srsrcs(insts),
             exec_cache: HashMap::new(),
+            project_pixel_masks: matches!(entry, Entry::Pixel(_, true)),
+            last_pixel_ballots: None,
             xs: None,
             xw: None,
             xc: None,
@@ -582,7 +589,7 @@ impl Lw {
         }
         lw.static_samplers = crate::gpu::recomp::constant_samplers(insts, leaders);
         let group_threads: Option<u32> = match entry {
-            Entry::Vertex(_) | Entry::Pixel(_) => None,
+            Entry::Vertex(_) | Entry::Pixel(..) => None,
             Entry::Kernel => None,
             Entry::Compute(cs) => Some(cs.threads.iter().product()),
             Entry::Mesh(ms) => Some(ms.threads),

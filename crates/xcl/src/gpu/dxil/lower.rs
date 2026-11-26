@@ -220,6 +220,10 @@ pub struct Lw {
     pub static_used: Vec<([u32; 4], bool, super::ops::Sampler)>,
     pub sampler_base: u32,
     pub exec_cache: HashMap<(Block, Value, Value), Value>,
+    /// Opt-in pixel translation keeps the four unmodified ballot results behind the most
+    /// recent full mask. An exact same-block SSA pair can project its own bit from them.
+    pub project_pixel_masks: bool,
+    pub last_pixel_ballots: Option<(Block, Value, Value, [[Value; 2]; 4])>,
     /// groupshared exchange words of the split form
     /// split form: the halves' exchange words (storage, first index) and the lane counter
     pub xs: Option<(super::ops::GroupShared, u32)>,
@@ -936,12 +940,19 @@ impl Lw {
 
     /// This lane's bit of a mask (lo, hi).
     pub fn lane_of(&mut self, lo: Value, hi: Value) -> Value {
-        if self.wave64 {
-            self.lanebit(lo, hi)
-        } else {
-            let z = self.c(0);
-            self.lanebit(lo, z)
+        let hi = if self.wave64 { hi } else { self.c(0) };
+        if let Some((b, orig_lo, orig_hi, ballots)) = self.last_pixel_ballots {
+            let key = (self.cur(), lo, hi);
+            if key == (b, orig_lo, orig_hi) {
+                if let Some(&bit) = self.exec_cache.get(&key) {
+                    return bit;
+                }
+                let bit = self.project_quad_ballots(&ballots);
+                self.exec_cache.insert(key, bit);
+                return bit;
+            }
         }
+        self.lanebit(lo, hi)
     }
 
     // ------------------------------------------------------------ dispatch
