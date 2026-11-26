@@ -739,7 +739,7 @@ mod ps_ballot_tests {
         let mut state = 0x7aa8b247u32;
         for wave64 in [false, true] {
             let opt = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
-            let mut lw = super::Lw::new(&[], &Default::default(), opt, &kernel::Entry::Pixel(ps_interface(), true));
+            let mut lw = super::Lw::new(&[], &Default::default(), opt, &kernel::Entry::Pixel(ps_interface()));
             for pattern in 0..26 {
                 let raw: [[u32; 2]; 4] = std::array::from_fn(|p| std::array::from_fn(|halfwave| {
                     state ^= state << 13;

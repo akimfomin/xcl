@@ -168,6 +168,13 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     cached_shader(shader_cache(), key, blob, from_disk).map(|shader| shader.as_ref().clone())
 }
 
+/// Opt in to exact own-bit projection at pixel mask consumers. The cache and
+/// translator must use the same policy throughout the process.
+fn project_pixel_masks() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_DIRECT_PIXEL_MASK_PROJECTION").as_deref() == Ok("1"))
+}
+
 /// Translations on disk: a console program's (DXIL, static samplers) by its bytes, so a run
 /// does not translate again what an earlier run of the same XCL build translated. The DXIL
 /// cache is keyed by the generated HLSL, so it needs the translation first: a retail game's
@@ -483,7 +490,21 @@ mod translated {
         split: bool,
         translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
-        cached_rerouted(dir, identity(), direct_output(), blob, stage, sampler_base, windows, split, translate)
+        let id = identity();
+        let id = if stage == Stage::Pixel && super::project_pixel_masks() {
+            pixel_projection_identity(id, stage, Backend::current())
+        } else {
+            id
+        };
+        cached_rerouted(dir, id, direct_output(), blob, stage, sampler_base, windows, split, translate)
+    }
+
+    pub(super) fn pixel_projection_identity(id: u64, stage: Stage, backend: Backend) -> u64 {
+        if id != 0 && stage == Stage::Pixel && backend == Backend::DirectAll {
+            identity_for(&id.to_string(), "xcl-direct-pixel-mask-projection-v1")
+        } else {
+            id
+        }
     }
 
     /// What the direct translator's output depends on besides the HLSL path's identity: its
@@ -1002,6 +1023,9 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64: super::fssm_wave64(f, code), split: false, mem_windows: windows, sampler_base };
     let k = match (&mode, stage) {
         (Mode::Vertex(vs), Stage::Vertex) => crate::gpu::dxil::kernel::translate_vertex(code, o, vs)?,
+        (Mode::Pixel(ps), Stage::Pixel) if project_pixel_masks() => {
+            crate::gpu::dxil::kernel::translate_pixel_projected_masks(code, o, ps)?
+        }
         (Mode::Pixel(ps), Stage::Pixel) => crate::gpu::dxil::kernel::translate_pixel(code, o, ps)?,
         _ => return Err("the shader stage does not match its slot in the PSO".into()),
     };
@@ -1486,6 +1510,18 @@ mod shader_cache_tests {
         let second = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || panic!("v2 entry was not reused")).unwrap();
         assert_eq!(second.dxil, first.dxil);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pixel_mask_projection_tags_only_direct_graphics_pixel_cache_entries() {
+        use translated::{pixel_projection_identity as tag, Backend};
+        let base = 1729;
+        assert_ne!(tag(base, Stage::Pixel, Backend::DirectAll), base);
+        assert_eq!(tag(base, Stage::Compute, Backend::DirectAll), base);
+        assert_eq!(tag(base, Stage::Vertex, Backend::DirectAll), base);
+        assert_eq!(tag(base, Stage::Pixel, Backend::Hlsl), base);
+        assert_eq!(tag(base, Stage::Pixel, Backend::DirectCompute), base);
+        assert_eq!(tag(0, Stage::Pixel, Backend::DirectAll), 0);
     }
 
     /// Direct DXIL entries have their own identity per routing mode and translator version;
