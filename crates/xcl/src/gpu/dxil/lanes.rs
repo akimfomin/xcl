@@ -184,6 +184,23 @@ impl Lw {
         if let Some(&v) = self.exec_cache.get(&key) {
             return v;
         }
+        if self.project_pixel_masks {
+            self.discover_mask_join((lo, hi));
+            if self.pixel_unions.contains_key(&(lo, hi)) || self.pixel_joins.contains_key(&(lo, hi)) {
+                let window = self.project_mask_window((lo, hi), 0);
+                let index = self.andc(self.lane31, 3);
+                let shifted = self.lshr(window, index);
+                let low_bit = self.andc(shifted, 1);
+                let bit = self.nz(low_bit);
+                self.exec_cache.insert(key, bit);
+                return bit;
+            }
+            if let Some(ballots) = self.pixel_ballots.get(&(lo, hi)).copied() {
+                let bit = self.project_quad_ballots(&ballots);
+                self.exec_cache.insert(key, bit);
+                return bit;
+            }
+        }
         let w = if self.wave64 {
             let u = self.upper;
             self.sel(u, hi, lo)
@@ -501,22 +518,23 @@ impl Lw {
             (m0, z)
         };
         if self.project_pixel_masks {
-            self.last_pixel_ballots = Some((self.cur(), lo, hi, votes));
+            self.pixel_ballots.insert((lo, hi), votes);
         }
         (lo, hi)
     }
 
-    pub(super) fn project_quad_ballots(&mut self, ballots: &[[Value; 2]; 4]) -> Value {
-        let mut w = [self.c(0); 4];
-        for (p, ballot) in ballots.iter().enumerate() {
-            w[p] = if self.wave64 {
-                self.sel(self.upper, ballot[1], ballot[0])
-            } else if let Some(half) = self.gfx_half {
-                self.sel(half, ballot[1], ballot[0])
-            } else {
-                ballot[0]
-            };
+    fn selected_vote_word(&mut self, ballot: [Value; 2]) -> Value {
+        if self.wave64 {
+            self.sel(self.upper, ballot[1], ballot[0])
+        } else if let Some(half) = self.gfx_half {
+            self.sel(half, ballot[1], ballot[0])
+        } else {
+            ballot[0]
         }
+    }
+
+    pub(super) fn project_quad_ballots(&mut self, ballots: &[[Value; 2]; 4]) -> Value {
+        let w = ballots.map(|vote| self.selected_vote_word(vote));
         let b0 = self.andc(self.lane31, 1);
         let b0 = self.nz(b0);
         let b1 = self.andc(self.lane31, 2);
@@ -530,6 +548,139 @@ impl Lw {
         let nibble = self.lshr(vote, shift);
         let nibble = self.andc(nibble, 15);
         self.nz(nibble)
+    }
+
+    fn knows_pixel_mask(&self, mask: (Value, Value)) -> bool {
+        self.pixel_ballots.contains_key(&mask) || self.pixel_unions.contains_key(&mask) || self.pixel_joins.contains_key(&mask)
+    }
+
+    fn discover_mask_join(&mut self, mask: (Value, Value)) {
+        if self.knows_pixel_mask(mask) {
+            return;
+        }
+        let Some(block) = self.s.m.def_block(mask.0) else { return };
+        if !self.ssa.is_sealed(block) {
+            return;
+        }
+        let low = self.s.m.phi_incoming(mask.0);
+        let [(l0, p0), (l1, p1)] = low[..] else { return };
+        if p0 == p1 || p0 == block || p1 == block {
+            return;
+        }
+        let high = if self.wave64 {
+            if self.s.m.def_block(mask.1) != Some(block) {
+                return;
+            }
+            let hi = self.s.m.phi_incoming(mask.1);
+            let [(h0, a), (h1, b)] = hi[..] else { return };
+            if (a, b) == (p0, p1) { [h0, h1] } else if (a, b) == (p1, p0) { [h1, h0] } else { return }
+        } else {
+            let z = self.c(0);
+            if mask.1 != z { return }
+            [z, z]
+        };
+        let edges = [((l0, high[0]), p0), ((l1, high[1]), p1)];
+        if edges.iter().any(|&(edge, _)| self.knows_pixel_mask(edge)) {
+            self.pixel_joins.insert(mask, (block, edges));
+        }
+    }
+
+    pub(super) fn note_mask_union(&mut self, result: (Value, Value), inputs: [(Value, Value); 2]) {
+        // Only actual OR definitions establish dominance of both inputs. Even an
+        // equivalent folded constant could be available before one of the sources.
+        let [a, b] = inputs;
+        if !self.s.m.is_or_of(result.0, a.0, b.0) ||
+            self.wave64 && (!self.s.m.is_or_of(result.1, a.1, b.1) ||
+                self.s.m.def_block(result.0) != self.s.m.def_block(result.1)) {
+            return;
+        }
+        for input in inputs {
+            self.discover_mask_join(input);
+        }
+        if !inputs.contains(&result) && inputs.iter().any(|&mask| self.knows_pixel_mask(mask)) {
+            self.pixel_unions.entry(result).or_insert(inputs);
+        }
+    }
+
+    /// A wave ballot contributes one bit to its reconstructed mask iff any carrier
+    /// for that member is live. Taking the union over all members therefore tests
+    /// the original full-mask zero condition, including carriers outside this quad.
+    pub(super) fn ballot_nonempty(&mut self, lo: Value, hi: Value) -> Option<Value> {
+        let votes = self.pixel_ballots.get(&(lo, hi)).copied()?;
+        let words = votes.map(|v| if self.wave64 { self.or(v[0], v[1]) } else { self.selected_vote_word(v) });
+        let a = self.or(words[0], words[1]);
+        let b = self.or(words[2], words[3]);
+        let any = self.or(a, b);
+        Some(self.nz(any))
+    }
+
+    /// The four bits at positions (lane & ~3) + p. No wave operation is emitted at
+    /// the consumer. Unknown leaves (including unmatched PHIs and arbitrary scalar masks) use
+    /// the original words. A depth bound keeps translation costs predictable.
+    pub(super) fn project_mask_window(&mut self, mask: (Value, Value), depth: usize) -> Value {
+        let current = self.cur();
+        let low = self.s.m.def_block(mask.0);
+        let high = self.s.m.def_block(mask.1);
+        // Exact words are already available at this point. The lane identity was
+        // defined in the graphics entry, and these operations are pure integer ALU.
+        let placement = if self.knows_pixel_mask(mask) && (low == high || self.s.m.const_u64(mask.1).is_some()) {
+            low.unwrap_or(current)
+        } else {
+            current
+        };
+        let key = (placement, mask.0, mask.1);
+        if let Some(&window) = self.pixel_quad_windows.get(&key) {
+            return window;
+        }
+        let previous = self.s.m.set_insert_before_term(true);
+        self.s.m.set_block(placement);
+        let shift = self.andc(self.lane31, 28);
+        let window = if let Some(votes) = self.pixel_ballots.get(&mask).copied() {
+            let mut window = self.c(0);
+            for (p, vote) in votes.into_iter().enumerate() {
+                let word = self.selected_vote_word(vote);
+                let carriers = self.lshr(word, shift);
+                let nibble = self.andc(carriers, 15);
+                let present = self.nz(nibble);
+                let flag = self.u(present);
+                let bit = self.shlc(flag, p as u32);
+                window = self.or(window, bit);
+            }
+            window
+        } else if let Some((block, edges)) = self.pixel_joins.get(&mask).copied().filter(|_| depth < 24) {
+            let word = self.s.m.i32();
+            let phi = self.s.m.phi_at(block, word);
+            self.pixel_quad_windows.insert(key, phi);
+            for (source, predecessor) in edges {
+                self.s.m.set_block(predecessor);
+                let incoming = self.project_mask_window(source, depth + 1);
+                self.s.m.add_incoming(phi, incoming, predecessor);
+            }
+            phi
+        } else if let Some([a, b]) = self.pixel_unions.get(&mask).copied().filter(|_| depth < 24) {
+            let wa = self.project_mask_window(a, depth + 1);
+            let wb = self.project_mask_window(b, depth + 1);
+            self.or(wa, wb)
+        } else {
+            let word = if self.wave64 { self.sel(self.upper, mask.1, mask.0) } else { mask.0 };
+            let window = self.lshr(word, shift);
+            self.andc(window, 15)
+        };
+        self.pixel_quad_windows.insert(key, window);
+        self.s.m.set_block(current);
+        self.s.m.set_insert_before_term(previous);
+        window
+    }
+
+    pub(super) fn known_quad_window(&mut self, mask: (Value, Value)) -> Option<Value> {
+        if self.project_pixel_masks {
+            self.discover_mask_join(mask);
+        }
+        if self.project_pixel_masks && self.knows_pixel_mask(mask) {
+            Some(self.project_mask_window(mask, 0))
+        } else {
+            None
+        }
     }
 
     /// Pixel-shader ballot including helper lanes (parity with HLSL `ballot_px` in
@@ -766,6 +917,170 @@ mod ps_ballot_tests {
                     assert_eq!(got, u64::from(expected), "wave64={wave64} lane={lane} pattern={pattern}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn quad_and_empty_projections_match_independent_full_mask_words() {
+        let mut state = 0xc50f_6271u32;
+        for wave64 in [false, true] {
+            let opt = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+            let mut lw = super::Lw::new(&[], &Default::default(), opt, &kernel::Entry::Pixel(ps_interface(), true));
+            for pattern in 0..35 {
+                let votes: [[u32; 2]; 4] = std::array::from_fn(|p| std::array::from_fn(|half| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    match pattern {
+                        0 => 0,
+                        1 => if half == 0 { 0x8000_0000 } else { 0 },
+                        2 => if half == 1 { 0x8000_0000 } else { 0 },
+                        3..=18 => ((pattern - 3) as u32).rotate_left((4 * (p + half)) as u32),
+                        _ => state,
+                    }
+                }));
+                // Reconstruct with scalar loops over all 64 lanes. This oracle does
+                // not use the emitted word spreading, projection, or OR recipe.
+                let full: [u32; 2] = std::array::from_fn(|half| (0..32).fold(0, |mask, lane| {
+                    let bit = (0..4).any(|carrier| votes[lane & 3][half] & (1 << ((lane & !3) + carrier)) != 0);
+                    mask | (u32::from(bit) << lane)
+                }));
+                for lane in 0..64u32 {
+                    let half = (lane >> 5) as usize;
+                    lw.lane31 = lw.c(lane & 31);
+                    lw.upper = lw.b(wave64 && half == 1);
+                    lw.gfx_half = if wave64 { None } else { Some(lw.b(half == 1)) };
+                    // Changing constants emulates independent shader invocations.
+                    lw.pixel_ballots.clear();
+                    lw.pixel_unions.clear();
+                    lw.pixel_quad_windows.clear();
+                    let mask = if wave64 { (lw.c(full[0]), lw.c(full[1])) } else { (lw.c(full[half]), lw.c(0)) };
+                    let original = votes.map(|v| [lw.c(v[0]), lw.c(v[1])]);
+                    lw.pixel_ballots.insert(mask, original);
+                    let nonempty = lw.ballot_nonempty(mask.0, mask.1).unwrap();
+                    let expected_any = if wave64 { full[0] | full[1] != 0 } else { full[half] != 0 };
+                    assert_eq!(lw.s.m.const_u64(nonempty), Some(u64::from(expected_any)));
+                    let window = lw.project_mask_window(mask, 0);
+                    let shift = lane & 28;
+                    assert_eq!(lw.s.m.const_u64(window), Some(u64::from(full[half] >> shift & 15)));
+                    let extra = (lw.c(0x0f01_f0a0), lw.c(if wave64 { 0x01e0_30b0 } else { 0 }));
+                    let merged = (lw.or(mask.0, extra.0), lw.or(mask.1, extra.1));
+                    lw.note_mask_union(merged, [mask, extra]);
+                    let window = lw.project_mask_window(merged, 0);
+                    let other = if wave64 && half == 1 { 0x01e0_30b0 } else { 0x0f01_f0a0 };
+                    let expected = (full[half] | other) >> shift & 15;
+                    assert_eq!(lw.s.m.const_u64(window), Some(u64::from(expected)));
+                    if wave64 {
+                        let mixed = (mask.0, extra.1);
+                        if mixed != mask {
+                            assert!(lw.ballot_nonempty(mixed.0, mixed.1).is_none());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matched_mask_phi_uses_each_predecessor_and_keeps_folded_or_untracked() {
+        for wave64 in [false, true] {
+            let ps = ps_interface();
+            let options = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+            let mut lw = super::Lw::new(&[], &Default::default(), options, &kernel::Entry::Pixel(ps.clone(), true));
+            lw.setup_lanes_gfx();
+            lw.setup_pixel(&ps, &Default::default());
+            let entry = lw.cur();
+            lw.seal(entry);
+            // The entry ballot dominates both arms. The sibling obtains an independent
+            // mask; reversing the order of the high PHI entries must retain its origin.
+            let lane = lw.lane31;
+            let qa = lw.andc(lane, 15);
+            let original = lw.ballot_ps_quad(qa);
+            let branch = lw.andc(lane, 1);
+            let branch = lw.nz(branch);
+            let yes = lw.block(Some(1));
+            let no = lw.block(Some(1));
+            let join = lw.block(Some(2));
+            lw.cond_br(branch, yes, no);
+            lw.s.m.set_block(yes);
+            let sibling_q = lw.xor(qa, lane);
+            let sibling = lw.ballot_ps_quad(sibling_q);
+            lw.br(join);
+            lw.s.m.set_block(no);
+            lw.br(join);
+            lw.s.m.set_block(join);
+            let word = lw.s.m.i32();
+            let lo = lw.s.m.phi_at(join, word);
+            lw.s.m.add_incoming(lo, sibling.0, yes);
+            lw.s.m.add_incoming(lo, original.0, no);
+            let z = lw.c(0);
+            let hi = if wave64 {
+                let ph = lw.s.m.phi_at(join, word);
+                lw.s.m.add_incoming(ph, original.1, no);
+                lw.s.m.add_incoming(ph, sibling.1, yes);
+                ph
+            } else { z };
+            lw.discover_mask_join((lo, hi));
+            assert!(lw.pixel_joins.contains_key(&(lo, hi)));
+            if wave64 {
+                lw.discover_mask_join((lo, original.1));
+                assert!(!lw.pixel_joins.contains_key(&(lo, original.1)));
+            }
+            let merged = (lw.or(lo, original.0), if wave64 { lw.or(hi, original.1) } else { z });
+            lw.note_mask_union(merged, [(lo, hi), original]);
+            assert!(lw.pixel_unions.contains_key(&merged));
+            // An unrelated existing value cannot establish dominance of either input.
+            lw.note_mask_union(original, [merged, (lo, hi)]);
+            assert!(!lw.pixel_unions.contains_key(&original));
+            let window = lw.project_mask_window(merged, 0);
+            let own = lw.lanebit(original.0, original.1);
+            let own_u = lw.u(own);
+            let mem = lw.mems[0];
+            let offset = lw.shlc(lane, 3);
+            lw.s.raw_store(mem, offset, &[window, own_u]);
+            lw.finish_gfx();
+            lw.s.m.ret();
+            let program = lw.finish([1, 1, 1], 0).unwrap();
+            validate::validate(&program.dxil).expect("valid matched projection across the diamond");
+            let ir = validate::disassemble(&program.dxil).unwrap();
+            assert!(!ir.contains("286331153"), "unobserved full masks survived in the diamond");
+            assert!(ir.contains("phi i32"), "both conditional inputs must contribute distinct values");
+        }
+    }
+
+    #[test]
+    fn own_bit_of_two_live_carry_masks_uses_each_ballot_producer() {
+        // Both mask pairs remain live after the second producer. The conditional moves
+        // select different position inputs so a reused or swapped mask changes exports.
+        let mut code = Vec::new();
+        let mut emit = |name, enc, fields: &[(&str, u64)]| {
+            code.extend(encode(name, enc, fields, None).unwrap());
+        };
+        for (dst, a, b) in [(16, 2, 3), (18, 3, 3)] {
+            emit("V_ADD_CO_U32", "VOP3_SDST_ENC", &[
+                ("VDST", 4), ("SDST", dst), ("SRC0", V + a), ("SRC1", V + b),
+            ]);
+        }
+        for (dst, mask) in [(6, 16), (7, 18)] {
+            emit("V_CNDMASK_B32", "ENC_VOP3", &[
+                ("VDST", dst), ("SRC0", V + 2), ("SRC1", V + 3), ("SRC2", mask),
+            ]);
+        }
+        emit("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 15), ("VSRC0", 6), ("VSRC1", 7),
+             ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1), ("VM", 1)]);
+        emit("S_ENDPGM", "ENC_SOPP", &[]);
+        for wave64 in [false, true] {
+            let opt = KernelOptions { wave64, split: false, mem_windows: 4, sampler_base: 0 };
+            let whole = kernel::translate_pixel(&code, opt, &ps_interface()).unwrap();
+            let projected = kernel::translate_pixel_projected_masks(&code, opt, &ps_interface()).unwrap();
+            validate::validate(&whole.dxil).unwrap();
+            validate::validate(&projected.dxil).unwrap();
+            let whole_ir = validate::disassemble(&whole.dxil).unwrap();
+            let projected_ir = validate::disassemble(&projected.dxil).unwrap();
+            let ballots = "call %dx.types.fouri32 @dx.op.waveActiveBallot(";
+            assert_eq!(whole_ir.matches(ballots).count(), projected_ir.matches(ballots).count());
+            assert!(whole_ir.contains("286331153"));
+            assert!(!projected_ir.contains("286331153"), "both full mask reconstructions should be dead");
         }
     }
 

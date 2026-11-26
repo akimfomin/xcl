@@ -538,6 +538,13 @@ impl Module {
             _ => Some(Block(0)),
         }
     }
+    /// Whether a word is an actual OR of these SSA values. An equivalent folded
+    /// value can predate its operands and does not establish their dominance.
+    pub(super) fn is_or_of(&self, v: Value, a: Value, b: Value) -> bool {
+        let Value::Inst(i) = v else { return false };
+        matches!(self.insts[i as usize].op, Op::Bin(BinOp::Or, l, r, 0)
+            if (l, r) == (a, b) || (l, r) == (b, a))
+    }
     /// When enabled, emitting into an already-terminated block inserts immediately
     /// before its terminator (used for hoisting pure computations to a value's
     /// defining block). Returns the previous setting.

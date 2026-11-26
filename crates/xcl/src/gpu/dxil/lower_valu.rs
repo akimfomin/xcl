@@ -1255,6 +1255,7 @@ impl Lw {
             };
             let (el, eh) = self.exec_mask();
             let qbase = self.andc(self.lane, !3);
+            let window = self.known_quad_window((el, eh));
             let mut q = self.c(0);
             for p in 0..4u32 {
                 let kp = self.c(p);
@@ -1269,8 +1270,13 @@ impl Lw {
                     ub
                 };
                 let cp = self.vopc_cond(d, opn, ty, qa, qb, m)?;
-                let lp = self.or(qbase, kp);
-                let ap = self.lanebit_at(el, eh, lp);
+                let ap = if let Some(window) = window {
+                    let bit = self.andc(window, 1 << p);
+                    self.nz(bit)
+                } else {
+                    let lp = self.or(qbase, kp);
+                    self.lanebit_at(el, eh, lp)
+                };
                 let bp = self.land(ap, cp);
                 let up = self.u(bp);
                 let sh = self.shlc(up, p);

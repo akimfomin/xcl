@@ -220,10 +220,16 @@ pub struct Lw {
     pub static_used: Vec<([u32; 4], bool, super::ops::Sampler)>,
     pub sampler_base: u32,
     pub exec_cache: HashMap<(Block, Value, Value), Value>,
-    /// Opt-in pixel translation keeps the four unmodified ballot results behind the most
-    /// recent full mask. An exact same-block SSA pair can project its own bit from them.
+    /// An exact SSA mask pair carries the unmodified votes that produced its two words.
+    /// Those votes dominate any legal use of the pair. Scalar users still see the words.
     pub project_pixel_masks: bool,
-    pub last_pixel_ballots: Option<(Block, Value, Value, [[Value; 2]; 4])>,
+    pub pixel_ballots: HashMap<(Value, Value), [[Value; 2]; 4]>,
+    /// Exact wordwise unions with at least one tracked pixel ballot ancestor.
+    pub pixel_unions: HashMap<(Value, Value), [(Value, Value); 2]>,
+    pub pixel_joins: HashMap<(Value, Value), (Block, [((Value, Value), Block); 2])>,
+    /// Four member bits of this invocation's aligned quad. A value may be reused
+    /// only in the block where its arithmetic was emitted.
+    pub pixel_quad_windows: HashMap<(Block, Value, Value), Value>,
     /// groupshared exchange words of the split form
     /// split form: the halves' exchange words (storage, first index) and the lane counter
     pub xs: Option<(super::ops::GroupShared, u32)>,
@@ -941,17 +947,6 @@ impl Lw {
     /// This lane's bit of a mask (lo, hi).
     pub fn lane_of(&mut self, lo: Value, hi: Value) -> Value {
         let hi = if self.wave64 { hi } else { self.c(0) };
-        if let Some((b, orig_lo, orig_hi, ballots)) = self.last_pixel_ballots {
-            let key = (self.cur(), lo, hi);
-            if key == (b, orig_lo, orig_hi) {
-                if let Some(&bit) = self.exec_cache.get(&key) {
-                    return bit;
-                }
-                let bit = self.project_quad_ballots(&ballots);
-                self.exec_cache.insert(key, bit);
-                return bit;
-            }
-        }
         self.lanebit(lo, hi)
     }
 
@@ -993,6 +988,12 @@ impl Lw {
         let name = d.inst.name.to_ascii_lowercase();
         let zero = |s: &mut Self, l: u64| {
             let lo = s.sreg(l);
+            if s.project_pixel_masks {
+                let hi = if s.wave64 { s.sreg(l + 1) } else { s.c(0) };
+                if let Some(nonempty) = s.ballot_nonempty(lo, hi) {
+                    return s.lnot(nonempty);
+                }
+            }
             let v = if s.wave64 {
                 let hi = s.sreg(l + 1);
                 s.or(lo, hi)
@@ -1403,7 +1404,14 @@ impl Lw {
                 (self.ashrc(x, 16), Scc::No)
             }
             "s_and_b32" => (self.and(a, b), Scc::Nz),
-            "s_or_b32" => (self.or(a, b), Scc::Nz),
+            "s_or_b32" => {
+                let value = self.or(a, b);
+                if self.project_pixel_masks && !self.wave64 {
+                    let z = self.c(0);
+                    self.note_mask_union((value, z), [(a, z), (b, z)]);
+                }
+                (value, Scc::Nz)
+            }
             "s_xor_b32" => (self.xor(a, b), Scc::Nz),
             "s_andn2_b32" => {
                 let n = self.not(b);
@@ -1762,7 +1770,13 @@ impl Lw {
                 let op = name.trim_start_matches("s_").trim_end_matches("_b64");
                 match op {
                     "and" => (self.and(al, bl), self.and(ah, bh)),
-                    "or" => (self.or(al, bl), self.or(ah, bh)),
+                    "or" => {
+                        let merged = (self.or(al, bl), self.or(ah, bh));
+                        if self.project_pixel_masks && self.wave64 {
+                            self.note_mask_union(merged, [(al, ah), (bl, bh)]);
+                        }
+                        merged
+                    }
                     "xor" => (self.xor(al, bl), self.xor(ah, bh)),
                     "andn2" => {
                         let (x, y) = (self.not(bl), self.not(bh));

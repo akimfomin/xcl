@@ -501,7 +501,7 @@ mod translated {
 
     pub(super) fn pixel_projection_identity(id: u64, stage: Stage, backend: Backend) -> u64 {
         if id != 0 && stage == Stage::Pixel && backend == Backend::DirectAll {
-            identity_for(&id.to_string(), "xcl-direct-pixel-mask-projection-v1")
+            identity_for(&id.to_string(), "xcl-direct-pixel-mask-projection-v3")
         } else {
             id
         }
